@@ -11,6 +11,10 @@ Config comes from environment variables:
     LTC_ADDRESSES          - comma-separated list of Litecoin addresses
     POLL_SECONDS            - how often to check, default 8
     PREFIX                  - command prefix, default "?"
+    BLOCKCYPHER_TOKEN       - optional, free token from blockcypher.com.
+                              Without one you share a 200 req/hour pool with
+                              everyone else on your IP and will get 429s.
+                              With one you get your own 3 req/sec allowance.
 
 Balances persist in balances.json (created automatically) so restarts don't
 cause false "change" notifications.
@@ -41,6 +45,13 @@ MIN_NOTIFY_USD = 0
 # Shared embed color (white) used across all commands/notifications.
 EMBED_COLOR = discord.Color(0xFFFFFF)
 
+# If BlockCypher starts rate-limiting us (HTTP 429), back off from hitting it
+# again for this many seconds instead of retrying every single poll cycle -
+# that's what was spamming the Railway logs.
+RATE_LIMIT_BACKOFF_SECONDS = 60
+_blockcypher_backoff_until = 0.0
+_last_429_logged = 0.0
+
 
 def get_setting(env_var, default=None, required=True):
     value = os.environ.get(env_var, default)
@@ -54,6 +65,7 @@ DISCORD_USER_ID = int(get_setting("DISCORD_USER_ID"))
 LTC_ADDRESSES = [a.strip() for a in get_setting("LTC_ADDRESSES", default="", required=False).split(",") if a.strip()]
 POLL_SECONDS = int(get_setting("POLL_SECONDS", default=8, required=False))
 PREFIX = get_setting("PREFIX", default="?", required=False)
+BLOCKCYPHER_TOKEN = get_setting("BLOCKCYPHER_TOKEN", default=None, required=False)
 
 
 def load_balances():
@@ -79,11 +91,40 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 # Balance / price fetch helpers
 # ---------------------------------------------------------------------------
 
+def _with_bc_token(url: str) -> str:
+    if not BLOCKCYPHER_TOKEN:
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}token={BLOCKCYPHER_TOKEN}"
+
+
+def _note_blockcypher_429():
+    """Record a rate-limit hit and log it at most once per backoff window,
+    instead of once per address per poll (that's what was spamming logs)."""
+    global _blockcypher_backoff_until, _last_429_logged
+    now = time.monotonic()
+    _blockcypher_backoff_until = now + RATE_LIMIT_BACKOFF_SECONDS
+    if now - _last_429_logged > RATE_LIMIT_BACKOFF_SECONDS:
+        print(
+            f"[warn] BlockCypher rate limit hit (HTTP 429) - pausing BlockCypher "
+            f"calls for {RATE_LIMIT_BACKOFF_SECONDS}s. "
+            f"{'Add a BLOCKCYPHER_TOKEN env var for a higher limit.' if not BLOCKCYPHER_TOKEN else ''}"
+        )
+        _last_429_logged = now
+
+
+def _blockcypher_available() -> bool:
+    return time.monotonic() >= _blockcypher_backoff_until
+
+
 async def get_ltc_balance_only(session: aiohttp.ClientSession, address: str):
     """Fast, lightweight balance-only check (no tx history) - used as a fallback."""
-    url = f"https://api.blockcypher.com/v1/ltc/main/addrs/{address}/balance"
+    url = _with_bc_token(f"https://api.blockcypher.com/v1/ltc/main/addrs/{address}/balance")
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+            if resp.status == 429:
+                _note_blockcypher_429()
+                return None
             if resp.status != 200:
                 return None
             data = await resp.json()
@@ -94,9 +135,13 @@ async def get_ltc_balance_only(session: aiohttp.ClientSession, address: str):
 
 async def get_ltc_info(session: aiohttp.ClientSession, address: str):
     """Returns dict with balance (LTC float) and unconfirmed_txrefs (pending txs).
-    Falls back to a fast balance-only check if the full endpoint is slow/fails,
-    so a slow pending-tx lookup never blocks the regular balance update."""
-    url = f"https://api.blockcypher.com/v1/ltc/main/addrs/{address}"
+    Skips BlockCypher entirely while we're in a rate-limit backoff window, and
+    only falls back to the lighter balance-only endpoint on non-429 failures
+    (retrying immediately after a 429 just earns another 429)."""
+    if not _blockcypher_available():
+        return None
+
+    url = _with_bc_token(f"https://api.blockcypher.com/v1/ltc/main/addrs/{address}")
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             if resp.status == 200:
@@ -105,6 +150,9 @@ async def get_ltc_info(session: aiohttp.ClientSession, address: str):
                     "balance": data.get("balance", 0) / 1e8,
                     "unconfirmed_txrefs": data.get("unconfirmed_txrefs", []),
                 }
+            if resp.status == 429:
+                _note_blockcypher_429()
+                return None
             print(f"[warn] LTC info fetch failed for {address}: HTTP {resp.status}, falling back")
     except (aiohttp.ClientError, asyncio.TimeoutError):
         print(f"[warn] LTC info fetch timed out for {address}, falling back to balance-only")
