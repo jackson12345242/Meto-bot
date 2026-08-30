@@ -8,6 +8,8 @@ slash commands.
 Config comes from environment variables:
     DISCORD_TOKEN        - the bot's token
     DISCORD_USER_ID       - your Discord user ID (numeric), who gets DMed
+                            (this is also the ONLY user allowed to run any
+                            slash command - see owner_only() below)
     LTC_ADDRESSES          - comma-separated list of Litecoin addresses
     POLL_SECONDS            - how often to check, default 8
     PREFIX                  - command prefix, default "?"
@@ -85,6 +87,36 @@ balances = load_balances()
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+
+
+# ---------------------------------------------------------------------------
+# Access control - only DISCORD_USER_ID may run slash commands
+# ---------------------------------------------------------------------------
+
+def owner_only():
+    """App-command check that rejects everyone except DISCORD_USER_ID.
+
+    Since User Install lets anyone add this bot to their own account and DM
+    it, this check is what actually keeps the commands private to you -
+    Discord itself has no allowlist for installs.
+    """
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.user.id != DISCORD_USER_ID:
+            await interaction.response.send_message(
+                "You're not authorized to use this bot.", ephemeral=True
+            )
+            return False
+        return True
+    return discord.app_commands.check(predicate)
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: discord.app_commands.AppCommandError):
+    # CheckFailure is already handled (owner_only sends its own message).
+    # Anything else, log it so it doesn't fail silently.
+    if isinstance(error, discord.app_commands.CheckFailure):
+        return
+    print(f"[error] app command error: {error}")
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +353,7 @@ async def poll_balances_error(error):
 # ---------------------------------------------------------------------------
 
 @bot.tree.command(name="balance", description="Show current wallet balances")
+@owner_only()
 @discord.app_commands.allowed_installs(guilds=True, users=True)
 @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def balance_cmd(interaction: discord.Interaction):
@@ -375,6 +408,7 @@ class WalletView(discord.ui.View):
 
 
 @bot.tree.command(name="wallet", description="Show wallet address to send crypto")
+@owner_only()
 @discord.app_commands.allowed_installs(guilds=True, users=True)
 @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def wallet_cmd(interaction: discord.Interaction):
@@ -398,6 +432,7 @@ async def wallet_cmd(interaction: discord.Interaction):
 
 @bot.tree.command(name="imlimited", description="Send a message in a clean embed")
 @discord.app_commands.describe(message="The message to display")
+@owner_only()
 @discord.app_commands.allowed_installs(guilds=True, users=True)
 @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def imlimited_cmd(interaction: discord.Interaction, message: str):
@@ -432,6 +467,10 @@ async def on_ready():
 @bot.command(name="balances")
 async def balances_cmd(ctx):
     """?balances - show current known balances"""
+    if ctx.author.id != DISCORD_USER_ID:
+        await ctx.send("You're not authorized to use this bot.")
+        return
+
     if not balances:
         await ctx.send("No balances tracked yet — waiting on the first poll.")
         return
@@ -466,6 +505,10 @@ async def balances_cmd(ctx):
 @bot.command(name="checknow")
 async def checknow_cmd(ctx):
     """?checknow - force an immediate balance check"""
+    if ctx.author.id != DISCORD_USER_ID:
+        await ctx.send("You're not authorized to use this bot.")
+        return
+
     await ctx.send("Checking now...")
     await poll_balances()
     await ctx.send("Done.")
