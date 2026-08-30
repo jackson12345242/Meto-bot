@@ -9,7 +9,7 @@ Config comes from environment variables:
     DISCORD_TOKEN        - the bot's token
     DISCORD_USER_ID       - your Discord user ID (numeric), who gets DMed
     LTC_ADDRESSES          - comma-separated list of Litecoin addresses
-    POLL_SECONDS            - how often to check, default 45
+    POLL_SECONDS            - how often to check, default 8
     PREFIX                  - command prefix, default "?"
 
 Balances persist in balances.json (created automatically) so restarts don't
@@ -52,7 +52,7 @@ def get_setting(env_var, default=None, required=True):
 DISCORD_TOKEN = get_setting("DISCORD_TOKEN")
 DISCORD_USER_ID = int(get_setting("DISCORD_USER_ID"))
 LTC_ADDRESSES = [a.strip() for a in get_setting("LTC_ADDRESSES", default="", required=False).split(",") if a.strip()]
-POLL_SECONDS = int(get_setting("POLL_SECONDS", default=45, required=False))
+POLL_SECONDS = int(get_setting("POLL_SECONDS", default=8, required=False))
 PREFIX = get_setting("PREFIX", default="?", required=False)
 
 
