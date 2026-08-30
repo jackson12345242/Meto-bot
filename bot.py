@@ -1,15 +1,14 @@
 """
-Crypto Balance Tracker - Discord Bot
+Litecoin Balance Tracker - Discord Bot
 -------------------------------------
-Watches Litecoin and BEP20 USDT addresses. DMs the owner whenever a balance
-changes by at least MIN_NOTIFY_USD, and offers /balance, /wallet, and
-/imlimited slash commands.
+Watches Litecoin addresses. DMs the owner whenever a balance changes (any
+amount, confirmed or pending), and offers /balance, /wallet, and /imlimited
+slash commands.
 
 Config comes from environment variables:
     DISCORD_TOKEN        - the bot's token
     DISCORD_USER_ID       - your Discord user ID (numeric), who gets DMed
     LTC_ADDRESSES          - comma-separated list of Litecoin addresses
-    BSC_USDT_ADDRESSES     - comma-separated list of BEP20 USDT addresses
     POLL_SECONDS            - how often to check, default 45
     PREFIX                  - command prefix, default "?"
 
@@ -29,19 +28,8 @@ from discord.ext import commands, tasks
 
 BALANCES_PATH = "balances.json"
 
-# BEP20 (Binance-Peg) USDT contract address on BNB Smart Chain
-USDT_BEP20_CONTRACT = "0x55d398326f99059fF775485246999027B3197955"
-
-# Free public BSC RPC endpoints (no API key needed) - tried in order
-BSC_RPC_ENDPOINTS = [
-    "https://bsc-dataseed.binance.org/",
-    "https://bsc-dataseed1.defibit.io/",
-    "https://bsc-dataseed1.ninicoin.io/",
-]
-
 COIN_META = {
     "LTC": {"icon": "🪙", "network": "Litecoin", "coingecko_id": "litecoin"},
-    "USDT": {"icon": "💵", "network": "BNB Smart Chain (BEP20)", "coingecko_id": "tether"},
 }
 
 PRICE_CACHE = {"data": {}, "ts": 0.0}
@@ -64,7 +52,6 @@ def get_setting(env_var, default=None, required=True):
 DISCORD_TOKEN = get_setting("DISCORD_TOKEN")
 DISCORD_USER_ID = int(get_setting("DISCORD_USER_ID"))
 LTC_ADDRESSES = [a.strip() for a in get_setting("LTC_ADDRESSES", default="", required=False).split(",") if a.strip()]
-BSC_USDT_ADDRESSES = [a.strip() for a in get_setting("BSC_USDT_ADDRESSES", default="", required=False).split(",") if a.strip()]
 POLL_SECONDS = int(get_setting("POLL_SECONDS", default=45, required=False))
 PREFIX = get_setting("PREFIX", default="?", required=False)
 
@@ -128,65 +115,19 @@ async def get_ltc_info(session: aiohttp.ClientSession, address: str):
     return {"balance": fallback_balance, "unconfirmed_txrefs": []}
 
 
-async def get_usdt_bep20_balance(session: aiohttp.ClientSession, address: str):
-    """Returns balance in USDT (float), or None on failure. Races all free public
-    BSC RPC endpoints concurrently and returns whichever responds first."""
-    padded_address = address.lower().replace("0x", "").rjust(64, "0")
-    call_data = "0x70a08231" + padded_address
-
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "eth_call",
-        "params": [{"to": USDT_BEP20_CONTRACT, "data": call_data}, "latest"],
-        "id": 1,
-    }
-
-    async def try_endpoint(rpc_url):
-        async with session.post(rpc_url, json=payload, timeout=aiohttp.ClientTimeout(total=6)) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json()
-            result = data.get("result")
-            if not result or result == "0x":
-                return None
-            return int(result, 16) / 1e18
-
-    tasks_list = [asyncio.create_task(try_endpoint(url)) for url in BSC_RPC_ENDPOINTS]
-    try:
-        for coro in asyncio.as_completed(tasks_list, timeout=8):
-            try:
-                result = await coro
-                if result is not None:
-                    for t in tasks_list:
-                        t.cancel()
-                    return result
-            except Exception:
-                continue
-    except asyncio.TimeoutError:
-        pass
-    finally:
-        for t in tasks_list:
-            if not t.done():
-                t.cancel()
-
-    print(f"[warn] USDT balance fetch failed for {address}: all RPC endpoints failed")
-    return None
-
-
 async def get_usd_prices(session: aiohttp.ClientSession):
-    """Returns {'LTC': price, 'USDT': price}, cached for 60 seconds."""
+    """Returns {'LTC': price}, cached for 60 seconds."""
     now = time.monotonic()
     if PRICE_CACHE["data"] and now - PRICE_CACHE["ts"] < 60:
         return PRICE_CACHE["data"]
 
-    url = "https://api.coingecko.com/api/v3/simple/price?ids=litecoin,tether&vs_currencies=usd"
+    url = "https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd"
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 prices = {
                     "LTC": data.get("litecoin", {}).get("usd", 0),
-                    "USDT": data.get("tether", {}).get("usd", 1),
                 }
                 PRICE_CACHE["data"] = prices
                 PRICE_CACHE["ts"] = now
@@ -194,7 +135,7 @@ async def get_usd_prices(session: aiohttp.ClientSession):
     except (aiohttp.ClientError, asyncio.TimeoutError):
         pass
 
-    return PRICE_CACHE["data"] or {"LTC": 0, "USDT": 1}
+    return PRICE_CACHE["data"] or {"LTC": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -209,9 +150,6 @@ async def poll_balances():
     async with aiohttp.ClientSession() as session:
         ltc_results = await asyncio.gather(
             *(get_ltc_info(session, address) for address in LTC_ADDRESSES)
-        )
-        usdt_results = await asyncio.gather(
-            *(get_usdt_bep20_balance(session, address) for address in BSC_USDT_ADDRESSES)
         )
 
         prices = await get_usd_prices(session)
@@ -243,8 +181,7 @@ async def poll_balances():
                     "incoming": is_incoming,
                 }
 
-            # New pending tx we haven't alerted on yet -> "seen in mempool" notice,
-            # but only if it clears the same $ threshold as confirmed transfers.
+            # New pending tx we haven't alerted on yet -> "seen in mempool" notice.
             for txid, tx in current_pending.items():
                 if txid not in old_pending:
                     pending_usd = tx["value"] * prices.get("LTC", 0)
@@ -259,19 +196,6 @@ async def poll_balances():
 
             if old_confirmed != new_confirmed or old_pending != current_pending:
                 balances[key] = {"confirmed": new_confirmed, "pending": current_pending}
-                changed = True
-
-        for address, new_balance in zip(BSC_USDT_ADDRESSES, usdt_results):
-            if new_balance is None:
-                continue
-            key = f"usdt_bep20:{address}"
-            old_balance = balances.get(key)
-            if old_balance is not None and abs(new_balance - old_balance) > 1e-6:
-                diff_usd = abs(new_balance - old_balance) * prices.get("USDT", 1)
-                if diff_usd >= MIN_NOTIFY_USD:
-                    await notify(session, owner, address, old_balance, new_balance, "USDT")
-            if old_balance != new_balance:
-                balances[key] = new_balance
                 changed = True
 
     if changed:
@@ -316,9 +240,8 @@ async def notify(session, owner, address, old_balance, new_balance, unit):
     diff_usd = abs(diff) * price
     new_balance_usd = new_balance * price
 
-    title_suffix = " (CONFIRMED)" if unit == "LTC" else ""
     embed = discord.Embed(
-        title=f"{meta['icon']} {unit} — {direction}{title_suffix}",
+        title=f"{meta['icon']} {unit} — {direction} (CONFIRMED)",
         color=EMBED_COLOR,
         timestamp=datetime.now(timezone.utc),
     )
@@ -383,19 +306,6 @@ async def balance_cmd(interaction: discord.Interaction):
             inline=False,
         )
 
-    for address in BSC_USDT_ADDRESSES:
-        bal = balances.get(f"usdt_bep20:{address}")
-        if bal is None:
-            continue
-        usd = bal * prices.get("USDT", 1)
-        total_usd += usd
-        meta = COIN_META["USDT"]
-        embed.add_field(
-            name=f"{meta['icon']} USDT — {meta['network']}",
-            value=f"{bal:.6f} USDT\n${usd:,.2f}",
-            inline=False,
-        )
-
     if not embed.fields:
         embed.description = "No balances tracked yet — waiting on the first poll."
     else:
@@ -405,48 +315,36 @@ async def balance_cmd(interaction: discord.Interaction):
 
 
 class WalletView(discord.ui.View):
-    def __init__(self, ltc_address: str, usdt_address: str):
+    def __init__(self, ltc_address: str):
         super().__init__(timeout=None)
         self.ltc_address = ltc_address
-        self.usdt_address = usdt_address
         if not ltc_address:
             self.ltc_button.disabled = True
-        if not usdt_address:
-            self.usdt_button.disabled = True
 
     @discord.ui.button(label="LTC", style=discord.ButtonStyle.secondary, emoji="🪙")
     async def ltc_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(self.ltc_address, ephemeral=True)
 
-    @discord.ui.button(label="USDT (BEP20)", style=discord.ButtonStyle.secondary, emoji="💵")
-    async def usdt_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(self.usdt_address, ephemeral=True)
 
-
-@bot.tree.command(name="wallet", description="Show wallet addresses to send crypto")
+@bot.tree.command(name="wallet", description="Show wallet address to send crypto")
 @discord.app_commands.allowed_installs(guilds=True, users=True)
 @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def wallet_cmd(interaction: discord.Interaction):
     ltc_address = LTC_ADDRESSES[0] if LTC_ADDRESSES else None
-    usdt_address = BSC_USDT_ADDRESSES[0] if BSC_USDT_ADDRESSES else None
 
-    if not ltc_address and not usdt_address:
-        await interaction.response.send_message("No wallet addresses are configured yet.", ephemeral=True)
+    if not ltc_address:
+        await interaction.response.send_message("No wallet address is configured yet.", ephemeral=True)
         return
 
     embed = discord.Embed(
         title="💰 Wallet",
-        description="Tap a coin below to reveal the address to send to.",
+        description="Tap the button below to reveal the address to send to.",
         color=EMBED_COLOR,
     )
-    if ltc_address:
-        meta = COIN_META["LTC"]
-        embed.add_field(name=f"{meta['icon']} LTC — {meta['network']}", value="Tap **LTC** below", inline=False)
-    if usdt_address:
-        meta = COIN_META["USDT"]
-        embed.add_field(name=f"{meta['icon']} USDT — {meta['network']}", value="Tap **USDT (BEP20)** below", inline=False)
+    meta = COIN_META["LTC"]
+    embed.add_field(name=f"{meta['icon']} LTC — {meta['network']}", value="Tap **LTC** below", inline=False)
 
-    view = WalletView(ltc_address, usdt_address)
+    view = WalletView(ltc_address)
     await interaction.response.send_message(embed=embed, view=view)
 
 
@@ -493,7 +391,7 @@ async def balances_cmd(ctx):
     lines = []
     for key, entry in balances.items():
         chain, address = key.split(":", 1)
-        unit = "LTC" if chain == "ltc" else "USDT"
+        unit = "LTC"
         short_addr = f"{address[:6]}...{address[-4:]}"
         if isinstance(entry, dict):
             confirmed = entry.get("confirmed", 0)
