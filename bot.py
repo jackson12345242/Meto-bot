@@ -22,18 +22,18 @@ Config comes from environment variables:
                               Without one you share a 200 req/hour pool with
                               everyone else on your IP and will get 429s.
                               With one you get your own 3 req/sec allowance.
-    BSCSCAN_TOKEN           - optional (but strongly recommended) free API key
-                              from bscscan.com, used for USDT BEP20 lookups.
-                              Without one you're limited to ~1-2 req/sec shared
-                              across your IP and will get 429s quickly with more
-                              than a couple addresses.
 
 Balances persist in balances.json (created automatically) so restarts don't
 cause false "change" notifications.
 
-NOTE on USDT BEP20: BscScan's free tokenbalance endpoint only reports the
-current confirmed on-chain balance, not pending/mempool transactions the way
-BlockCypher does for LTC. So USDT BEP20 only gets a "confirmed balance
+NOTE on USDT BEP20: this reads the balance directly off-chain via a free
+public BSC RPC endpoint (eth_call against the token contract's balanceOf),
+rather than through BscScan's API. BscScan's own API has been deprecated in
+favor of Etherscan API V2, which no longer offers a free tier for BSC - so
+going straight to an RPC node avoids needing any paid key at all. The
+tradeoff is the same one BscScan's free tier had: only the current confirmed
+on-chain balance is visible, not pending/mempool transactions the way
+BlockCypher exposes for LTC. So USDT BEP20 only gets a "confirmed balance
 changed" notification - there's no pending/mempool notice for it.
 """
 
@@ -63,6 +63,14 @@ BALANCES_PATH = "balances.json"
 USDT_BEP20_CONTRACT = "0x55d398326f99059fF775485246999027B3197955"
 USDT_BEP20_DECIMALS = 18
 
+# Free public BSC RPC endpoints (no API key needed) - tried concurrently,
+# first successful response wins.
+BSC_RPC_ENDPOINTS = [
+    "https://bsc-dataseed.binance.org/",
+    "https://bsc-dataseed1.defibit.io/",
+    "https://bsc-dataseed1.ninicoin.io/",
+]
+
 COIN_META = {
     "LTC": {"icon": "🪙", "network": "Litecoin", "coingecko_id": "litecoin"},
     "USDT_BEP20": {"icon": "💵", "network": "USDT (BEP20 / BSC)", "coingecko_id": "tether"},
@@ -83,10 +91,6 @@ EMBED_COLOR = discord.Color(0xFFFFFF)
 RATE_LIMIT_BACKOFF_SECONDS = 60
 _blockcypher_backoff_until = 0.0
 _last_429_logged = 0.0
-
-# Same idea, but for BscScan (used for USDT BEP20 lookups).
-_bscscan_backoff_until = 0.0
-_last_bscscan_429_logged = 0.0
 
 # /checknow is intentionally open to anyone (not owner_only), but since it
 # forces an immediate poll of the underlying APIs on demand, this cooldown
@@ -110,7 +114,6 @@ BEP20_ADDRESSES = [a.strip() for a in get_setting("BEP20_ADDRESSES", default="",
 POLL_SECONDS = int(get_setting("POLL_SECONDS", default=8, required=False))
 PREFIX = get_setting("PREFIX", default="?", required=False)
 BLOCKCYPHER_TOKEN = get_setting("BLOCKCYPHER_TOKEN", default=None, required=False)
-BSCSCAN_TOKEN = get_setting("BSCSCAN_TOKEN", default=None, required=False)
 
 
 def load_balances():
@@ -193,23 +196,6 @@ def _blockcypher_available() -> bool:
     return time.monotonic() >= _blockcypher_backoff_until
 
 
-def _note_bscscan_429():
-    global _bscscan_backoff_until, _last_bscscan_429_logged
-    now = time.monotonic()
-    _bscscan_backoff_until = now + RATE_LIMIT_BACKOFF_SECONDS
-    if now - _last_bscscan_429_logged > RATE_LIMIT_BACKOFF_SECONDS:
-        print(
-            f"[warn] BscScan rate limit hit (HTTP 429) - pausing BscScan "
-            f"calls for {RATE_LIMIT_BACKOFF_SECONDS}s. "
-            f"{'Add a BSCSCAN_TOKEN env var for a higher limit.' if not BSCSCAN_TOKEN else ''}"
-        )
-        _last_bscscan_429_logged = now
-
-
-def _bscscan_available() -> bool:
-    return time.monotonic() >= _bscscan_backoff_until
-
-
 async def get_ltc_balance_only(session: aiohttp.ClientSession, address: str):
     """Fast, lightweight balance-only check (no tx history) - used as a fallback."""
     url = _with_bc_token(f"https://api.blockcypher.com/v1/ltc/main/addrs/{address}/balance")
@@ -258,47 +244,50 @@ async def get_ltc_info(session: aiohttp.ClientSession, address: str):
 
 async def get_usdt_bep20_balance(session: aiohttp.ClientSession, address: str):
     """Returns confirmed USDT balance (float) for a BEP20 address, or None on
-    failure/rate-limit. Uses BscScan's tokenbalance endpoint, which returns the
-    raw integer token amount in the token's smallest unit as a string."""
-    if not _bscscan_available():
-        return None
+    failure. Calls the token contract's balanceOf(address) directly via
+    eth_call against free public BSC RPC nodes - no API key required. Races
+    all endpoints concurrently and returns whichever responds first, so one
+    slow/dead node doesn't hold up the whole poll cycle."""
+    padded_address = address.lower().replace("0x", "").rjust(64, "0")
+    call_data = "0x70a08231" + padded_address  # balanceOf(address) selector
 
-    params = (
-        f"module=account&action=tokenbalance"
-        f"&contractaddress={USDT_BEP20_CONTRACT}"
-        f"&address={address}&tag=latest"
-    )
-    if BSCSCAN_TOKEN:
-        params += f"&apikey={BSCSCAN_TOKEN}"
-    url = f"https://api.bscscan.com/api?{params}"
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [{"to": USDT_BEP20_CONTRACT, "data": call_data}, "latest"],
+        "id": 1,
+    }
 
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            if resp.status == 429:
-                _note_bscscan_429()
-                return None
+    async def try_endpoint(rpc_url):
+        async with session.post(rpc_url, json=payload, timeout=aiohttp.ClientTimeout(total=6)) as resp:
             if resp.status != 200:
-                print(f"[warn] USDT BEP20 fetch failed for {address}: HTTP {resp.status}")
                 return None
             data = await resp.json()
-            # BscScan wraps rate-limit / error conditions in a 200 response
-            # with status "0" and a message, rather than an HTTP error code.
-            if data.get("status") == "0":
-                message = data.get("message", "")
-                result = data.get("result", "")
-                if "rate limit" in message.lower() or "rate limit" in str(result).lower():
-                    _note_bscscan_429()
-                else:
-                    print(f"[warn] USDT BEP20 fetch error for {address}: {message} {result}")
+            result = data.get("result")
+            if not result or result == "0x":
                 return None
-            raw = data.get("result")
-            return int(raw) / (10 ** USDT_BEP20_DECIMALS)
-    except (aiohttp.ClientError, asyncio.TimeoutError):
-        print(f"[warn] USDT BEP20 fetch timed out for {address}")
-        return None
-    except (ValueError, TypeError):
-        print(f"[warn] USDT BEP20 fetch returned unparseable result for {address}")
-        return None
+            return int(result, 16) / (10 ** USDT_BEP20_DECIMALS)
+
+    tasks_list = [asyncio.create_task(try_endpoint(url)) for url in BSC_RPC_ENDPOINTS]
+    try:
+        for coro in asyncio.as_completed(tasks_list, timeout=8):
+            try:
+                result = await coro
+                if result is not None:
+                    for t in tasks_list:
+                        t.cancel()
+                    return result
+            except Exception:
+                continue
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        for t in tasks_list:
+            if not t.done():
+                t.cancel()
+
+    print(f"[warn] USDT BEP20 balance fetch failed for {address}: all RPC endpoints failed")
+    return None
 
 
 async def get_usd_prices(session: aiohttp.ClientSession):
@@ -393,9 +382,9 @@ async def poll_balances():
                 continue
             key = f"usdt_bep20:{address}"
 
-            # USDT BEP20 has no pending/mempool concept surfaced by the free
-            # BscScan endpoint, so it's stored simply as a float, same shape
-            # as the old plain-float LTC entries used to be.
+            # USDT BEP20 has no pending/mempool concept surfaced this way, so
+            # it's stored simply as a float, same shape as the old plain-float
+            # LTC entries used to be.
             old_balance = balances.get(key)
 
             if old_balance is not None and abs(new_balance - old_balance) > 1e-8:
