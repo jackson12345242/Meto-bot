@@ -8,8 +8,9 @@ slash commands.
 Config comes from environment variables:
     DISCORD_TOKEN        - the bot's token
     DISCORD_USER_ID       - your Discord user ID (numeric), who gets DMed
-                            (this is also the ONLY user allowed to run any
-                            slash command - see owner_only() below)
+                            (this is also the ONLY user allowed to run the
+                            owner-only slash commands - see owner_only() below.
+                            /checknow is the one exception -- anyone can run it.)
     LTC_ADDRESSES          - comma-separated list of Litecoin addresses
     POLL_SECONDS            - how often to check, default 8
     PREFIX                  - command prefix, default "?"
@@ -24,6 +25,7 @@ cause false "change" notifications.
 
 import asyncio
 import json
+import logging
 import os
 import time
 from datetime import datetime, timezone
@@ -31,6 +33,15 @@ from datetime import datetime, timezone
 import aiohttp
 import discord
 from discord.ext import commands, tasks
+
+# discord.py logs every gateway reconnect/resume at INFO level, which on a
+# long-running bot adds up to dozens of lines a day that all say the same
+# thing and drown out anything actually worth seeing. Reconnects/resumes on
+# their own aren't errors -- Discord gateway connections drop and resume
+# periodically as a matter of course -- so this just quiets that specific
+# noise down to WARNING+ (actual connection problems still show up).
+logging.getLogger("discord.gateway").setLevel(logging.WARNING)
+logging.getLogger("discord.client").setLevel(logging.WARNING)
 
 BALANCES_PATH = "balances.json"
 
@@ -53,6 +64,13 @@ EMBED_COLOR = discord.Color(0xFFFFFF)
 RATE_LIMIT_BACKOFF_SECONDS = 60
 _blockcypher_backoff_until = 0.0
 _last_429_logged = 0.0
+
+# /checknow is intentionally open to anyone (not owner_only), but since it
+# forces an immediate poll of the underlying BlockCypher API on demand, this
+# cooldown stops it from being spammed into a 429 by repeated rapid calls
+# from any caller.
+CHECKNOW_COOLDOWN_SECONDS = 15
+_last_manual_checknow = 0.0
 
 
 def get_setting(env_var, default=None, required=True):
@@ -90,15 +108,16 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
 
 # ---------------------------------------------------------------------------
-# Access control - only DISCORD_USER_ID may run slash commands
+# Access control - only DISCORD_USER_ID may run owner-only slash commands
 # ---------------------------------------------------------------------------
 
 def owner_only():
     """App-command check that rejects everyone except DISCORD_USER_ID.
 
     Since User Install lets anyone add this bot to their own account and DM
-    it, this check is what actually keeps the commands private to you -
-    Discord itself has no allowlist for installs.
+    it, this check is what actually keeps these commands private to you -
+    Discord itself has no allowlist for installs. NOT applied to /checknow,
+    which is deliberately open to anyone.
     """
     async def predicate(interaction: discord.Interaction) -> bool:
         if interaction.user.id != DISCORD_USER_ID:
@@ -448,6 +467,32 @@ async def imlimited_cmd(interaction: discord.Interaction, message: str):
     await interaction.response.send_message(embed=embed)
 
 
+@bot.tree.command(name="checknow", description="Force an immediate balance check")
+@discord.app_commands.allowed_installs(guilds=True, users=True)
+@discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def checknow_slash(interaction: discord.Interaction):
+    """
+    Deliberately NOT owner_only() -- anyone can run this, per request.
+    The cooldown below isn't an access restriction, just abuse protection:
+    since this forces an on-demand BlockCypher poll, letting it be spammed
+    with no limit at all would be an easy way for anyone to burn through
+    the BlockCypher rate limit for everyone (owner included).
+    """
+    global _last_manual_checknow
+    now = time.monotonic()
+    remaining = CHECKNOW_COOLDOWN_SECONDS - (now - _last_manual_checknow)
+    if remaining > 0:
+        await interaction.response.send_message(
+            f"Just checked recently — try again in {remaining:.0f}s.", ephemeral=True
+        )
+        return
+    _last_manual_checknow = now
+
+    await interaction.response.defer()
+    await poll_balances()
+    await interaction.followup.send("Balances checked.")
+
+
 # ---------------------------------------------------------------------------
 # Prefix commands (fallbacks)
 # ---------------------------------------------------------------------------
@@ -504,7 +549,8 @@ async def balances_cmd(ctx):
 
 @bot.command(name="checknow")
 async def checknow_cmd(ctx):
-    """?checknow - force an immediate balance check"""
+    """?checknow - force an immediate balance check (owner-only prefix version;
+    see /checknow above for the public slash version)"""
     if ctx.author.id != DISCORD_USER_ID:
         await ctx.send("You're not authorized to use this bot.")
         return
