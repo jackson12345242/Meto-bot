@@ -1,40 +1,27 @@
 """
-Litecoin + USDT (BEP20) Balance Tracker - Discord Bot
-------------------------------------------------------
-Watches Litecoin addresses AND USDT-on-BSC (BEP20) addresses. DMs the owner
-whenever a balance changes (any amount, confirmed or pending for LTC;
-confirmed only for USDT BEP20 - see note below), and offers /balance,
-/wallet, and /imlimited slash commands.
+Crypto Balance Tracker - Discord Bot
+-------------------------------------
+Watches Litecoin and BEP20 USDT addresses. DMs the owner whenever a balance
+changes by at least MIN_NOTIFY_USD, and offers /balance, /wallet, and
+/imlimited slash commands.
 
 Config comes from environment variables:
-    DISCORD_TOKEN         - the bot's token
+    DISCORD_TOKEN        - the bot's token
     DISCORD_USER_ID       - your Discord user ID (numeric), who gets DMed
                             (this is also the ONLY user allowed to run the
-                            owner-only slash commands - see owner_only() below.
-                            /checknow is the one exception -- anyone can run it.)
+                            owner-only commands - see owner_only() below.
+                            /wallet is open to everyone.)
     LTC_ADDRESSES          - comma-separated list of Litecoin addresses
-    BEP20_ADDRESSES        - comma-separated list of BSC (BEP20) addresses to
-                             watch for USDT balance
-    POLL_SECONDS            - how often to check, default 8
+    BSC_USDT_ADDRESSES     - comma-separated list of BEP20 USDT addresses
+    POLL_SECONDS            - how often to check, default 45
     PREFIX                  - command prefix, default "?"
-    BLOCKCYPHER_TOKEN       - optional, free token from blockcypher.com, used
-                              for LTC lookups.
-                              Without one you share a 200 req/hour pool with
-                              everyone else on your IP and will get 429s.
-                              With one you get your own 3 req/sec allowance.
 
 Balances persist in balances.json (created automatically) so restarts don't
 cause false "change" notifications.
 
-NOTE on USDT BEP20: this reads the balance directly off-chain via a free
-public BSC RPC endpoint (eth_call against the token contract's balanceOf),
-rather than through BscScan's API. BscScan's own API has been deprecated in
-favor of Etherscan API V2, which no longer offers a free tier for BSC - so
-going straight to an RPC node avoids needing any paid key at all. The
-tradeoff is the same one BscScan's free tier had: only the current confirmed
-on-chain balance is visible, not pending/mempool transactions the way
-BlockCypher exposes for LTC. So USDT BEP20 only gets a "confirmed balance
-changed" notification - there's no pending/mempool notice for it.
+Access control: only the Discord user with ID DISCORD_USER_ID can run
+/balance, /imlimited, and the ?balances / ?checknow prefix commands.
+/wallet is open to everyone so anyone can view the addresses to send to.
 """
 
 import asyncio
@@ -59,12 +46,10 @@ logging.getLogger("discord.client").setLevel(logging.WARNING)
 
 BALANCES_PATH = "balances.json"
 
-# USDT (BEP20 / BSC) token contract address - fixed, well-known constant.
+# BEP20 (Binance-Peg) USDT contract address on BNB Smart Chain
 USDT_BEP20_CONTRACT = "0x55d398326f99059fF775485246999027B3197955"
-USDT_BEP20_DECIMALS = 18
 
-# Free public BSC RPC endpoints (no API key needed) - tried concurrently,
-# first successful response wins.
+# Free public BSC RPC endpoints (no API key needed) - tried in order
 BSC_RPC_ENDPOINTS = [
     "https://bsc-dataseed.binance.org/",
     "https://bsc-dataseed1.defibit.io/",
@@ -73,31 +58,16 @@ BSC_RPC_ENDPOINTS = [
 
 COIN_META = {
     "LTC": {"icon": "🪙", "network": "Litecoin", "coingecko_id": "litecoin"},
-    "USDT_BEP20": {"icon": "💵", "network": "USDT (BEP20 / BSC)", "coingecko_id": "tether"},
+    "USDT": {"icon": "💵", "network": "BNB Smart Chain (BEP20)", "coingecko_id": "tether"},
 }
 
 PRICE_CACHE = {"data": {}, "ts": 0.0}
 
 # Minimum USD value a balance change must cross before the owner gets DMed.
-# Set to 0 so every detected change notifies, no matter how small.
-MIN_NOTIFY_USD = 0
+MIN_NOTIFY_USD = 0.10
 
 # Shared embed color (white) used across all commands/notifications.
-EMBED_COLOR = discord.Color(0xFFFFFF)
-
-# If BlockCypher starts rate-limiting us (HTTP 429), back off from hitting it
-# again for this many seconds instead of retrying every single poll cycle -
-# that's what was spamming the Railway logs.
-RATE_LIMIT_BACKOFF_SECONDS = 60
-_blockcypher_backoff_until = 0.0
-_last_429_logged = 0.0
-
-# /checknow is intentionally open to anyone (not owner_only), but since it
-# forces an immediate poll of the underlying APIs on demand, this cooldown
-# stops it from being spammed into a 429 by repeated rapid calls from any
-# caller.
-CHECKNOW_COOLDOWN_SECONDS = 15
-_last_manual_checknow = 0.0
+EMBED_COLOR = discord.Color( 0xFFFFFF)
 
 
 def get_setting(env_var, default=None, required=True):
@@ -110,10 +80,9 @@ def get_setting(env_var, default=None, required=True):
 DISCORD_TOKEN = get_setting("DISCORD_TOKEN")
 DISCORD_USER_ID = int(get_setting("DISCORD_USER_ID"))
 LTC_ADDRESSES = [a.strip() for a in get_setting("LTC_ADDRESSES", default="", required=False).split(",") if a.strip()]
-BEP20_ADDRESSES = [a.strip() for a in get_setting("BEP20_ADDRESSES", default="", required=False).split(",") if a.strip()]
-POLL_SECONDS = int(get_setting("POLL_SECONDS", default=8, required=False))
+BSC_USDT_ADDRESSES = [a.strip() for a in get_setting("BSC_USDT_ADDRESSES", default="", required=False).split(",") if a.strip()]
+POLL_SECONDS = int(get_setting("POLL_SECONDS", default=45, required=False))
 PREFIX = get_setting("PREFIX", default="?", required=False)
-BLOCKCYPHER_TOKEN = get_setting("BLOCKCYPHER_TOKEN", default=None, required=False)
 
 
 def load_balances():
@@ -136,16 +105,15 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
 
 # ---------------------------------------------------------------------------
-# Access control - only DISCORD_USER_ID may run owner-only slash commands
+# Access control - only DISCORD_USER_ID may run owner-restricted commands
 # ---------------------------------------------------------------------------
 
 def owner_only():
     """App-command check that rejects everyone except DISCORD_USER_ID.
 
     Since User Install lets anyone add this bot to their own account and DM
-    it, this check is what actually keeps these commands private to you -
-    Discord itself has no allowlist for installs. NOT applied to /checknow,
-    which is deliberately open to anyone.
+    it, this check is what actually keeps these commands private - Discord
+    itself has no allowlist for installs.
     """
     async def predicate(interaction: discord.Interaction) -> bool:
         if interaction.user.id != DISCORD_USER_ID:
@@ -170,40 +138,11 @@ async def on_app_command_error(interaction: discord.Interaction, error: discord.
 # Balance / price fetch helpers
 # ---------------------------------------------------------------------------
 
-def _with_bc_token(url: str) -> str:
-    if not BLOCKCYPHER_TOKEN:
-        return url
-    sep = "&" if "?" in url else "?"
-    return f"{url}{sep}token={BLOCKCYPHER_TOKEN}"
-
-
-def _note_blockcypher_429():
-    """Record a rate-limit hit and log it at most once per backoff window,
-    instead of once per address per poll (that's what was spamming logs)."""
-    global _blockcypher_backoff_until, _last_429_logged
-    now = time.monotonic()
-    _blockcypher_backoff_until = now + RATE_LIMIT_BACKOFF_SECONDS
-    if now - _last_429_logged > RATE_LIMIT_BACKOFF_SECONDS:
-        print(
-            f"[warn] BlockCypher rate limit hit (HTTP 429) - pausing BlockCypher "
-            f"calls for {RATE_LIMIT_BACKOFF_SECONDS}s. "
-            f"{'Add a BLOCKCYPHER_TOKEN env var for a higher limit.' if not BLOCKCYPHER_TOKEN else ''}"
-        )
-        _last_429_logged = now
-
-
-def _blockcypher_available() -> bool:
-    return time.monotonic() >= _blockcypher_backoff_until
-
-
 async def get_ltc_balance_only(session: aiohttp.ClientSession, address: str):
     """Fast, lightweight balance-only check (no tx history) - used as a fallback."""
-    url = _with_bc_token(f"https://api.blockcypher.com/v1/ltc/main/addrs/{address}/balance")
+    url = f"https://api.blockcypher.com/v1/ltc/main/addrs/{address}/balance"
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
-            if resp.status == 429:
-                _note_blockcypher_429()
-                return None
             if resp.status != 200:
                 return None
             data = await resp.json()
@@ -214,13 +153,9 @@ async def get_ltc_balance_only(session: aiohttp.ClientSession, address: str):
 
 async def get_ltc_info(session: aiohttp.ClientSession, address: str):
     """Returns dict with balance (LTC float) and unconfirmed_txrefs (pending txs).
-    Skips BlockCypher entirely while we're in a rate-limit backoff window, and
-    only falls back to the lighter balance-only endpoint on non-429 failures
-    (retrying immediately after a 429 just earns another 429)."""
-    if not _blockcypher_available():
-        return None
-
-    url = _with_bc_token(f"https://api.blockcypher.com/v1/ltc/main/addrs/{address}")
+    Falls back to a fast balance-only check if the full endpoint is slow/fails,
+    so a slow pending-tx lookup never blocks the regular balance update."""
+    url = f"https://api.blockcypher.com/v1/ltc/main/addrs/{address}"
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             if resp.status == 200:
@@ -229,9 +164,6 @@ async def get_ltc_info(session: aiohttp.ClientSession, address: str):
                     "balance": data.get("balance", 0) / 1e8,
                     "unconfirmed_txrefs": data.get("unconfirmed_txrefs", []),
                 }
-            if resp.status == 429:
-                _note_blockcypher_429()
-                return None
             print(f"[warn] LTC info fetch failed for {address}: HTTP {resp.status}, falling back")
     except (aiohttp.ClientError, asyncio.TimeoutError):
         print(f"[warn] LTC info fetch timed out for {address}, falling back to balance-only")
@@ -243,13 +175,10 @@ async def get_ltc_info(session: aiohttp.ClientSession, address: str):
 
 
 async def get_usdt_bep20_balance(session: aiohttp.ClientSession, address: str):
-    """Returns confirmed USDT balance (float) for a BEP20 address, or None on
-    failure. Calls the token contract's balanceOf(address) directly via
-    eth_call against free public BSC RPC nodes - no API key required. Races
-    all endpoints concurrently and returns whichever responds first, so one
-    slow/dead node doesn't hold up the whole poll cycle."""
+    """Returns balance in USDT (float), or None on failure. Races all free public
+    BSC RPC endpoints concurrently and returns whichever responds first."""
     padded_address = address.lower().replace("0x", "").rjust(64, "0")
-    call_data = "0x70a08231" + padded_address  # balanceOf(address) selector
+    call_data = "0x70a08231" + padded_address
 
     payload = {
         "jsonrpc": "2.0",
@@ -266,7 +195,7 @@ async def get_usdt_bep20_balance(session: aiohttp.ClientSession, address: str):
             result = data.get("result")
             if not result or result == "0x":
                 return None
-            return int(result, 16) / (10 ** USDT_BEP20_DECIMALS)
+            return int(result, 16) / 1e18
 
     tasks_list = [asyncio.create_task(try_endpoint(url)) for url in BSC_RPC_ENDPOINTS]
     try:
@@ -286,12 +215,12 @@ async def get_usdt_bep20_balance(session: aiohttp.ClientSession, address: str):
             if not t.done():
                 t.cancel()
 
-    print(f"[warn] USDT BEP20 balance fetch failed for {address}: all RPC endpoints failed")
+    print(f"[warn] USDT balance fetch failed for {address}: all RPC endpoints failed")
     return None
 
 
 async def get_usd_prices(session: aiohttp.ClientSession):
-    """Returns {'LTC': price, 'USDT_BEP20': price}, cached for 60 seconds."""
+    """Returns {'LTC': price, 'USDT': price}, cached for 60 seconds."""
     now = time.monotonic()
     if PRICE_CACHE["data"] and now - PRICE_CACHE["ts"] < 60:
         return PRICE_CACHE["data"]
@@ -303,7 +232,7 @@ async def get_usd_prices(session: aiohttp.ClientSession):
                 data = await resp.json()
                 prices = {
                     "LTC": data.get("litecoin", {}).get("usd", 0),
-                    "USDT_BEP20": data.get("tether", {}).get("usd", 1),
+                    "USDT": data.get("tether", {}).get("usd", 1),
                 }
                 PRICE_CACHE["data"] = prices
                 PRICE_CACHE["ts"] = now
@@ -311,7 +240,7 @@ async def get_usd_prices(session: aiohttp.ClientSession):
     except (aiohttp.ClientError, asyncio.TimeoutError):
         pass
 
-    return PRICE_CACHE["data"] or {"LTC": 0, "USDT_BEP20": 1}
+    return PRICE_CACHE["data"] or {"LTC": 0, "USDT": 1}
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +257,7 @@ async def poll_balances():
             *(get_ltc_info(session, address) for address in LTC_ADDRESSES)
         )
         usdt_results = await asyncio.gather(
-            *(get_usdt_bep20_balance(session, address) for address in BEP20_ADDRESSES)
+            *(get_usdt_bep20_balance(session, address) for address in BSC_USDT_ADDRESSES)
         )
 
         prices = await get_usd_prices(session)
@@ -360,7 +289,8 @@ async def poll_balances():
                     "incoming": is_incoming,
                 }
 
-            # New pending tx we haven't alerted on yet -> "seen in mempool" notice.
+            # New pending tx we haven't alerted on yet -> "seen in mempool" notice,
+            # but only if it clears the same $ threshold as confirmed transfers.
             for txid, tx in current_pending.items():
                 if txid not in old_pending:
                     pending_usd = tx["value"] * prices.get("LTC", 0)
@@ -377,21 +307,15 @@ async def poll_balances():
                 balances[key] = {"confirmed": new_confirmed, "pending": current_pending}
                 changed = True
 
-        for address, new_balance in zip(BEP20_ADDRESSES, usdt_results):
+        for address, new_balance in zip(BSC_USDT_ADDRESSES, usdt_results):
             if new_balance is None:
                 continue
             key = f"usdt_bep20:{address}"
-
-            # USDT BEP20 has no pending/mempool concept surfaced this way, so
-            # it's stored simply as a float, same shape as the old plain-float
-            # LTC entries used to be.
             old_balance = balances.get(key)
-
-            if old_balance is not None and abs(new_balance - old_balance) > 1e-8:
-                diff_usd = abs(new_balance - old_balance) * prices.get("USDT_BEP20", 1)
+            if old_balance is not None and abs(new_balance - old_balance) > 1e-6:
+                diff_usd = abs(new_balance - old_balance) * prices.get("USDT", 1)
                 if diff_usd >= MIN_NOTIFY_USD:
-                    await notify(session, owner, address, old_balance, new_balance, "USDT_BEP20")
-
+                    await notify(session, owner, address, old_balance, new_balance, "USDT")
             if old_balance != new_balance:
                 balances[key] = new_balance
                 changed = True
@@ -432,22 +356,22 @@ async def notify(session, owner, address, old_balance, new_balance, unit):
     direction = "RECEIVED" if diff > 0 else "SENT"
     short_addr = f"{address[:6]}...{address[-4:]}"
     meta = COIN_META[unit]
-    label = "USDT" if unit == "USDT_BEP20" else unit
 
     prices = await get_usd_prices(session)
     price = prices.get(unit, 0)
     diff_usd = abs(diff) * price
     new_balance_usd = new_balance * price
 
+    title_suffix = " (CONFIRMED)" if unit == "LTC" else ""
     embed = discord.Embed(
-        title=f"{meta['icon']} {label} — {direction} (CONFIRMED)",
+        title=f"{meta['icon']} {unit} — {direction}{title_suffix}",
         color=EMBED_COLOR,
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name="Network", value=meta["network"], inline=True)
     embed.add_field(name="Address", value=f"`{short_addr}`", inline=True)
-    embed.add_field(name="Amount", value=f"{abs(diff):.6f} {label}\n${diff_usd:,.2f}", inline=False)
-    embed.add_field(name="Balance Now", value=f"{new_balance:.6f} {label}\n${new_balance_usd:,.2f}", inline=False)
+    embed.add_field(name="Amount", value=f"{abs(diff):.6f} {unit}\n${diff_usd:,.2f}", inline=False)
+    embed.add_field(name="Balance Now", value=f"{new_balance:.6f} {unit}\n${new_balance_usd:,.2f}", inline=False)
 
     try:
         await owner.send(embed=embed)
@@ -506,16 +430,16 @@ async def balance_cmd(interaction: discord.Interaction):
             inline=False,
         )
 
-    for address in BEP20_ADDRESSES:
-        confirmed = balances.get(f"usdt_bep20:{address}")
-        if confirmed is None:
+    for address in BSC_USDT_ADDRESSES:
+        bal = balances.get(f"usdt_bep20:{address}")
+        if bal is None:
             continue
-        usd = confirmed * prices.get("USDT_BEP20", 1)
+        usd = bal * prices.get("USDT", 1)
         total_usd += usd
-        meta = COIN_META["USDT_BEP20"]
+        meta = COIN_META["USDT"]
         embed.add_field(
             name=f"{meta['icon']} USDT — {meta['network']}",
-            value=f"{confirmed:.6f} USDT\n${usd:,.2f}",
+            value=f"{bal:.6f} USDT\n${usd:,.2f}",
             inline=False,
         )
 
@@ -528,49 +452,52 @@ async def balance_cmd(interaction: discord.Interaction):
 
 
 class WalletView(discord.ui.View):
-    def __init__(self, ltc_address: str, usdt_bep20_address: str):
+    def __init__(self, ltc_address: str, usdt_address: str):
         super().__init__(timeout=None)
         self.ltc_address = ltc_address
-        self.usdt_bep20_address = usdt_bep20_address
+        self.usdt_address = usdt_address
         if not ltc_address:
             self.ltc_button.disabled = True
-        if not usdt_bep20_address:
+        if not usdt_address:
             self.usdt_button.disabled = True
 
+    # Open to everyone - no owner check, so anyone can tap and reveal the
+    # address to send to.
     @discord.ui.button(label="LTC", style=discord.ButtonStyle.secondary, emoji="🪙")
     async def ltc_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(self.ltc_address, ephemeral=True)
 
     @discord.ui.button(label="USDT (BEP20)", style=discord.ButtonStyle.secondary, emoji="💵")
     async def usdt_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(self.usdt_bep20_address, ephemeral=True)
+        await interaction.response.send_message(self.usdt_address, ephemeral=True)
 
 
-@bot.tree.command(name="wallet", description="Show wallet address to send crypto")
-@owner_only()
+# Open to everyone - no @owner_only() here, so anyone can run /wallet and
+# see the buttons that reveal the addresses.
+@bot.tree.command(name="wallet", description="Show wallet addresses to send crypto")
 @discord.app_commands.allowed_installs(guilds=True, users=True)
 @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def wallet_cmd(interaction: discord.Interaction):
     ltc_address = LTC_ADDRESSES[0] if LTC_ADDRESSES else None
-    usdt_bep20_address = BEP20_ADDRESSES[0] if BEP20_ADDRESSES else None
+    usdt_address = BSC_USDT_ADDRESSES[0] if BSC_USDT_ADDRESSES else None
 
-    if not ltc_address and not usdt_bep20_address:
-        await interaction.response.send_message("No wallet address is configured yet.", ephemeral=True)
+    if not ltc_address and not usdt_address:
+        await interaction.response.send_message("No wallet addresses are configured yet.", ephemeral=True)
         return
 
     embed = discord.Embed(
         title="💰 Wallet",
-        description="Tap a button below to reveal the address to send to.",
+        description="Tap a coin below to reveal the address to send to.",
         color=EMBED_COLOR,
     )
     if ltc_address:
         meta = COIN_META["LTC"]
         embed.add_field(name=f"{meta['icon']} LTC — {meta['network']}", value="Tap **LTC** below", inline=False)
-    if usdt_bep20_address:
-        meta = COIN_META["USDT_BEP20"]
+    if usdt_address:
+        meta = COIN_META["USDT"]
         embed.add_field(name=f"{meta['icon']} USDT — {meta['network']}", value="Tap **USDT (BEP20)** below", inline=False)
 
-    view = WalletView(ltc_address, usdt_bep20_address)
+    view = WalletView(ltc_address, usdt_address)
     await interaction.response.send_message(embed=embed, view=view)
 
 
@@ -590,32 +517,6 @@ async def imlimited_cmd(interaction: discord.Interaction, message: str):
         icon_url=interaction.user.display_avatar.url,
     )
     await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="checknow", description="Force an immediate balance check")
-@discord.app_commands.allowed_installs(guilds=True, users=True)
-@discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def checknow_slash(interaction: discord.Interaction):
-    """
-    Deliberately NOT owner_only() -- anyone can run this, per request.
-    The cooldown below isn't an access restriction, just abuse protection:
-    since this forces an on-demand poll of the underlying APIs, letting it be
-    spammed with no limit at all would be an easy way for anyone to burn
-    through those rate limits for everyone (owner included).
-    """
-    global _last_manual_checknow
-    now = time.monotonic()
-    remaining = CHECKNOW_COOLDOWN_SECONDS - (now - _last_manual_checknow)
-    if remaining > 0:
-        await interaction.response.send_message(
-            f"Just checked recently — try again in {remaining:.0f}s.", ephemeral=True
-        )
-        return
-    _last_manual_checknow = now
-
-    await interaction.response.defer()
-    await poll_balances()
-    await interaction.followup.send("Balances checked.")
 
 
 # ---------------------------------------------------------------------------
@@ -648,25 +549,21 @@ async def balances_cmd(ctx):
     lines = []
     for key, entry in balances.items():
         chain, address = key.split(":", 1)
+        unit = "LTC" if chain == "ltc" else "USDT"
         short_addr = f"{address[:6]}...{address[-4:]}"
-        if chain == "ltc":
-            if isinstance(entry, dict):
-                confirmed = entry.get("confirmed", 0)
-                pending_map = entry.get("pending", {})
-                pending_total = sum(
-                    tx["value"] if tx["incoming"] else -tx["value"] for tx in pending_map.values()
-                )
-                line = f"`{short_addr}` (LTC): {confirmed:.6f}"
-                if pending_map:
-                    sign = "+" if pending_total >= 0 else ""
-                    line += f" (⏳ {sign}{pending_total:.6f} pending)"
-                lines.append(line)
-            else:
-                lines.append(f"`{short_addr}` (LTC): {entry:.6f}")
-        elif chain == "usdt_bep20":
-            lines.append(f"`{short_addr}` (USDT BEP20): {entry:.6f}")
+        if isinstance(entry, dict):
+            confirmed = entry.get("confirmed", 0)
+            pending_map = entry.get("pending", {})
+            pending_total = sum(
+                tx["value"] if tx["incoming"] else -tx["value"] for tx in pending_map.values()
+            )
+            line = f"`{short_addr}` ({unit}): {confirmed:.6f}"
+            if pending_map:
+                sign = "+" if pending_total >= 0 else ""
+                line += f" (⏳ {sign}{pending_total:.6f} pending)"
+            lines.append(line)
         else:
-            lines.append(f"`{short_addr}` ({chain}): {entry}")
+            lines.append(f"`{short_addr}` ({unit}): {entry:.6f}")
 
     embed = discord.Embed(
         title="Tracked Balances",
@@ -678,8 +575,7 @@ async def balances_cmd(ctx):
 
 @bot.command(name="checknow")
 async def checknow_cmd(ctx):
-    """?checknow - force an immediate balance check (owner-only prefix version;
-    see /checknow above for the public slash version)"""
+    """?checknow - force an immediate balance check"""
     if ctx.author.id != DISCORD_USER_ID:
         await ctx.send("You're not authorized to use this bot.")
         return
