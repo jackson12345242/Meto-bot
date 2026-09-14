@@ -11,6 +11,7 @@ Config comes from environment variables:
                             (this is also the ONLY user allowed to run the
                             owner-only commands - see owner_only() below.
                             /wallet is open to everyone.)
+                            Defaults to 1318513875372605481 if not set.
     LTC_ADDRESSES          - comma-separated list of Litecoin addresses
     BSC_USDT_ADDRESSES     - comma-separated list of BEP20 USDT addresses
     POLL_SECONDS            - how often to check, default 45
@@ -64,10 +65,23 @@ COIN_META = {
 PRICE_CACHE = {"data": {}, "ts": 0.0}
 
 # Minimum USD value a balance change must cross before the owner gets DMed.
-MIN_NOTIFY_USD = 0.10
+MIN_NOTIFY_USD = 1.00
 
-# Shared embed color (white) used across all commands/notifications.
-EMBED_COLOR = discord.Color( 0xFFFFFF)
+# Shared embed color (dark brown) used across all commands/notifications.
+EMBED_COLOR = discord.Color(0x1B1716)
+
+# --- Blockcypher rate-limit backoff -----------------------------------
+# blockcypher's free tier returns HTTP 429 once you exceed its per-second/
+# per-hour request quota. Previously every poll (every POLL_SECONDS) would
+# immediately retry the same address and log a fresh warning, which just
+# re-triggers the rate limit and floods the console with identical lines.
+# Instead: once an address 429s, back off on that address for a while
+# (honoring the Retry-After header if the API sends one) and only log once
+# when the backoff starts, not on every subsequent poll.
+DEFAULT_429_BACKOFF = 90  # seconds, used when no Retry-After header is sent
+MAX_429_BACKOFF = 600  # cap so we don't back off forever
+RATE_LIMIT_UNTIL = {}  # address -> monotonic timestamp when it's OK to retry
+RATE_LIMIT_STREAK = {}  # address -> consecutive 429 count, for backoff growth
 
 
 def get_setting(env_var, default=None, required=True):
@@ -78,7 +92,10 @@ def get_setting(env_var, default=None, required=True):
 
 
 DISCORD_TOKEN = get_setting("DISCORD_TOKEN")
-DISCORD_USER_ID = int(get_setting("DISCORD_USER_ID"))
+# Hardcoded default owner/authorized user ID. This is the only account that
+# can run the owner-only commands (/balance, /imlimited, ?balances,
+# ?checknow). /wallet stays open to everyone regardless of this value.
+DISCORD_USER_ID = int(get_setting("DISCORD_USER_ID", default="1318513875372605481", required=False))
 LTC_ADDRESSES = [a.strip() for a in get_setting("LTC_ADDRESSES", default="", required=False).split(",") if a.strip()]
 BSC_USDT_ADDRESSES = [a.strip() for a in get_setting("BSC_USDT_ADDRESSES", default="", required=False).split(",") if a.strip()]
 POLL_SECONDS = int(get_setting("POLL_SECONDS", default=45, required=False))
@@ -143,6 +160,9 @@ async def get_ltc_balance_only(session: aiohttp.ClientSession, address: str):
     url = f"https://api.blockcypher.com/v1/ltc/main/addrs/{address}/balance"
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+            if resp.status == 429:
+                _enter_backoff(address, resp.headers.get("Retry-After"))
+                return None
             if resp.status != 200:
                 return None
             data = await resp.json()
@@ -151,19 +171,55 @@ async def get_ltc_balance_only(session: aiohttp.ClientSession, address: str):
         return None
 
 
+def _enter_backoff(address: str, retry_after_header):
+    """Record that `address` is rate-limited and shouldn't be retried until
+    the backoff window passes. Logs once per backoff entry instead of once
+    per poll."""
+    streak = RATE_LIMIT_STREAK.get(address, 0) + 1
+    RATE_LIMIT_STREAK[address] = streak
+
+    if retry_after_header is not None:
+        try:
+            delay = float(retry_after_header)
+        except (TypeError, ValueError):
+            delay = DEFAULT_429_BACKOFF
+    else:
+        # exponential-ish growth on repeated 429s, capped
+        delay = min(DEFAULT_429_BACKOFF * streak, MAX_429_BACKOFF)
+
+    was_already_in_backoff = RATE_LIMIT_UNTIL.get(address, 0) > time.monotonic()
+    RATE_LIMIT_UNTIL[address] = time.monotonic() + delay
+
+    if not was_already_in_backoff:
+        print(f"[warn] LTC {address}: rate limited (429), backing off {delay:.0f}s")
+
+
+def _in_backoff(address: str) -> bool:
+    return RATE_LIMIT_UNTIL.get(address, 0) > time.monotonic()
+
+
 async def get_ltc_info(session: aiohttp.ClientSession, address: str):
     """Returns dict with balance (LTC float) and unconfirmed_txrefs (pending txs).
     Falls back to a fast balance-only check if the full endpoint is slow/fails,
-    so a slow pending-tx lookup never blocks the regular balance update."""
+    so a slow pending-tx lookup never blocks the regular balance update.
+    Skips the network call entirely while the address is in a 429 backoff
+    window, and clears the backoff/streak once a request succeeds again."""
+    if _in_backoff(address):
+        return None
+
     url = f"https://api.blockcypher.com/v1/ltc/main/addrs/{address}"
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             if resp.status == 200:
                 data = await resp.json()
+                RATE_LIMIT_STREAK.pop(address, None)
                 return {
                     "balance": data.get("balance", 0) / 1e8,
                     "unconfirmed_txrefs": data.get("unconfirmed_txrefs", []),
                 }
+            if resp.status == 429:
+                _enter_backoff(address, resp.headers.get("Retry-After"))
+                return None
             print(f"[warn] LTC info fetch failed for {address}: HTTP {resp.status}, falling back")
     except (aiohttp.ClientError, asyncio.TimeoutError):
         print(f"[warn] LTC info fetch timed out for {address}, falling back to balance-only")
@@ -171,6 +227,7 @@ async def get_ltc_info(session: aiohttp.ClientSession, address: str):
     fallback_balance = await get_ltc_balance_only(session, address)
     if fallback_balance is None:
         return None
+    RATE_LIMIT_STREAK.pop(address, None)
     return {"balance": fallback_balance, "unconfirmed_txrefs": []}
 
 
